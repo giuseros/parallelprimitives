@@ -26,15 +26,24 @@ void reduceSum(T *X, T* result, size_t const N)
     }
     __syncthreads();
 
-    for (int offset = blockDim.x/2; offset!=0; offset<<=1){
-        buffer[threadIdx.x]+=buffer[threadIdx.x+offset];
+    for (int offset = blockDim.x/2; offset!=0; offset>>=1){
+        if (threadIdx.x < offset){
+            buffer[threadIdx.x]+=buffer[threadIdx.x+offset];
+        }
         __syncthreads();
     }
 
 
     if (threadIdx.x == 0){
-        *result = buffer[0];
+        *result = buffer[threadIdx.x];
     }
+}
+
+template <typename T>
+__global__
+void scanSum(T* X, size_t const N)
+{
+
 }
 
 
@@ -74,7 +83,6 @@ int main()
     auto X = createVector<double>(N);
     auto x = createVector<double>(1);
     reduceSum<<<1, 256, 256*sizeof(double)>>>(X, x, N);
-    auto Y = gatherAndDestroy<double>(X, N);
     auto y = gatherAndDestroy<double>(x, 1);
     cout<<y<<endl;
 
