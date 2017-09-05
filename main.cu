@@ -22,7 +22,7 @@ void reduceSum(T *X, T* result, size_t const N)
     if (idx < N){
         buffer[threadIdx.x] = X[idx];
     }else{
-        buffer[threadIdx.x] = 0;
+        buffer[threadIdx.x] = T(0);
     }
     __syncthreads();
 
@@ -43,6 +43,45 @@ template <typename T>
 __global__
 void scanSum(T* X, size_t const N)
 {
+    size_t const idx = threadIdx.x;
+    extern __shared__ T buffer[];
+    if (idx < N){
+        buffer[threadIdx.x] = X[idx];
+    }else {
+        buffer[threadIdx.x] = T(0);
+    }
+
+    __syncthreads();
+
+    // Down-sweep
+    for (size_t offset = 2; offset <=  blockDim.x; offset *= 2 ){
+        if (idx < blockDim.x/offset){
+            size_t const element1 = (offset/2-1) + offset*idx;
+            size_t const element2 = element1 + offset/2;
+            buffer[element2] += buffer[element1];
+        }
+        __syncthreads();
+    }
+
+    // Up-sweep
+    buffer[blockDim.x-1] = 0;
+
+    __syncthreads();
+    for (size_t offset = blockDim.x; offset >=2; offset /= 2){
+        if (idx < blockDim.x/offset){
+            size_t const element1 = (offset/2-1) + offset*idx;
+            size_t const element2 = element1 + offset/2;
+
+            T tmp = buffer[element2];
+            buffer[element2] += buffer[element1];
+            buffer[element1] = tmp;
+        }
+    }
+
+
+    if (idx < N){
+        X[idx] = buffer[idx];
+    }
 
 }
 
@@ -79,12 +118,11 @@ std::ostream& operator<<(std::ostream& out, std::vector<T> const& X){
 
 int main()
 {
-    size_t const N(10);
+    size_t const N(8);
     auto X = createVector<double>(N);
-    auto x = createVector<double>(1);
-    reduceSum<<<1, 256, 256*sizeof(double)>>>(X, x, N);
-    auto y = gatherAndDestroy<double>(x, 1);
-    cout<<y<<endl;
+    scanSum<<<1, 256, 256*sizeof(double)>>>(X, N);
+    auto Y = gatherAndDestroy<double>(X, N);
+    cout<<Y<<endl;
 
     return 0;
 }
