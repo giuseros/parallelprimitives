@@ -39,50 +39,103 @@ void reduceSum(T *X, T* result, size_t const N)
     }
 }
 
+#define NUM_BANKS 16
+#define LOG_NUM_BANKS 4
+
 template <typename T>
 __global__
-void scanSum(T* X, size_t const N)
+void scanSumNoConflicts(T* X, size_t const n)
 {
-    size_t const idx = threadIdx.x;
     extern __shared__ T buffer[];
-    if (idx < N){
-        buffer[threadIdx.x] = X[idx];
-    }else {
-        buffer[threadIdx.x] = T(0);
-    }
 
-    __syncthreads();
+    size_t const idx = threadIdx.x;
+    size_t offset = 1;
+
+    buffer[2*idx] = X[2*idx];
+    buffer[2*idx+1] = X[2*idx+1];
 
     // Down-sweep
-    for (size_t offset = 2; offset <=  blockDim.x; offset *= 2 ){
-        if (idx < blockDim.x/offset){
-            size_t const element1 = (offset/2-1) + offset*idx;
-            size_t const element2 = element1 + offset/2;
+    for (size_t d = (n >> 1); d > 0; d >>= 1){
+        __syncthreads();
+
+        if (idx < d){
+            size_t const element1 = offset*(2*idx+1)-1;
+            size_t const element2 = offset*(2*idx+2)-1;
             buffer[element2] += buffer[element1];
         }
-        __syncthreads();
+        offset *= 2;
     }
 
     // Up-sweep
-    buffer[blockDim.x-1] = 0;
+    if (idx == 0){ buffer[n-1] = 0; }
+
+    for (size_t d = 1; d < n; d *= 2){
+
+        offset >>= 1;
+        __syncthreads();
+
+        if (idx < d){
+            size_t const element1 = offset*(2*idx+1)-1;
+            size_t const element2 = offset*(2*idx+2)-1;
+
+            T tmp = buffer[element1];
+            buffer[element1] = buffer[element2];
+            buffer[element2] += tmp;
+        }
+
+    }
 
     __syncthreads();
-    for (size_t offset = blockDim.x; offset >=2; offset /= 2){
-        if (idx < blockDim.x/offset){
-            size_t const element1 = (offset/2-1) + offset*idx;
-            size_t const element2 = element1 + offset/2;
+    X[2*idx] = buffer[2*idx];
+    X[2*idx+1] = buffer[2*idx+1];
+}
 
-            T tmp = buffer[element2];
+template <typename T>
+__global__
+void scanSum(T* X, size_t const n)
+{
+    extern __shared__ T buffer[];
+
+    size_t const idx = threadIdx.x;
+    size_t offset = 1;
+
+    buffer[2*idx] = X[2*idx];
+    buffer[2*idx+1] = X[2*idx+1];
+
+    // Down-sweep
+    for (size_t d = (n >> 1); d > 0; d >>= 1){
+        __syncthreads();
+
+        if (idx < d){
+            size_t const element1 = offset*(2*idx+1)-1;
+            size_t const element2 = offset*(2*idx+2)-1;
             buffer[element2] += buffer[element1];
-            buffer[element1] = tmp;
         }
+        offset *= 2;
     }
 
+    // Up-sweep
+    if (idx == 0){ buffer[n-1] = 0; }
 
-    if (idx < N){
-        X[idx] = buffer[idx];
+    for (size_t d = 1; d < n; d *= 2){
+
+        offset >>= 1;
+        __syncthreads();
+
+        if (idx < d){
+            size_t const element1 = offset*(2*idx+1)-1;
+            size_t const element2 = offset*(2*idx+2)-1;
+
+            T tmp = buffer[element1];
+            buffer[element1] = buffer[element2];
+            buffer[element2] += tmp;
+        }
+
     }
 
+    __syncthreads();
+    X[2*idx] = buffer[2*idx];
+    X[2*idx+1] = buffer[2*idx+1];
 }
 
 
@@ -91,6 +144,7 @@ T *createVector(size_t N)
 {
     std::vector<T> X(N);
     for (int i = 0; i < N; i++) { X[i] = T(i); }
+    cout<<X<<endl;
 
     T * result;
     cudaMalloc(&result, N*sizeof(T));
@@ -118,11 +172,22 @@ std::ostream& operator<<(std::ostream& out, std::vector<T> const& X){
 
 int main()
 {
-    size_t const N(8);
-    auto X = createVector<double>(N);
-    scanSum<<<1, 256, 256*sizeof(double)>>>(X, N);
-    auto Y = gatherAndDestroy<double>(X, N);
+    size_t const N(512);
+    auto X = createVector<float>(N);
+    cudaEvent_t start, stop;
+    float time;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+
+    scanSum<<<1, N/2, N*sizeof(float)>>>(X, N);
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+    auto Y = gatherAndDestroy<float>(X, N);
     cout<<Y<<endl;
+    cout<<time<<endl;
 
     return 0;
 }
