@@ -4,14 +4,23 @@
 #include "constants.cuh"
 
 struct Plus{
+	template<typename T>
 	inline static __host__ __device__
-	double apply(double a, double b)
+	T apply(T a, T b)
 	{
-		return a+b;
+		return T(a+b);
 	}
 
+	template<typename T>
+	inline static __host__ __device__
+	T identity(T){ return T(0); }
+
+	template <typename T>
 	inline static __device__
-	double identity(){ return 0; }
+	T apply_atomic(T *a_ptr, T b)
+	{
+		return atomicAdd(a_ptr, b);
+	}
 };
 
 struct Max{
