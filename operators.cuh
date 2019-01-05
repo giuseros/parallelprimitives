@@ -2,6 +2,7 @@
 #define OPERATORS_CUH__
 
 #include "constants.cuh"
+#include "traits.cuh"
 
 struct Plus{
 	template<typename T>

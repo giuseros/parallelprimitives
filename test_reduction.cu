@@ -69,10 +69,12 @@ void run_reduction_matlab()
 		float s1(0);
 		float s2(0);
 
+		gpuVector<T> d_output(1);
+
 		for (int r = 0; r < num_repetitions; r++)
 		{
-			s1 += gputimeit(reduce<Plus, T>, dX, ReductionMethod::shared_mem_reduction);
-			s2 += gputimeit(reduce<Plus, T>, dX, ReductionMethod::warp_reduction);
+			s1 += gputimeit(reduce_kernel<Plus, T>, dX.data(), d_output.data(), dX.size(), ReductionMethod::shared_mem_reduction);
+			s2 += gputimeit(reduce_kernel<Plus, T>, dX.data(), d_output.data(), dX.size(), ReductionMethod::warp_reduction);
 		}
 
 		gpu_algo1_times.push_back(s1/num_repetitions);
