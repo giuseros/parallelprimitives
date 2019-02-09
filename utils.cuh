@@ -4,7 +4,7 @@
 #include "gpuvector.cuh"
 #include <iostream>
 
-#define divUp(x,y) ((x+y+1)/y)
+#define divUp(x,y) ((x+y-1)/y)
 
 
 template<typename T>

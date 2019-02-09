@@ -11,7 +11,7 @@ template <typename OP, typename T>
 inline __device__
 T reduce_vector_2(const typename vector_t<T,2>::vec_type v)
 {
-		return OP::apply(v.x, v.y);
+	return OP::apply(v.x, v.y);
 }
 
 template <typename OP, typename T>
@@ -22,8 +22,6 @@ T reduce_vector_4(const typename vector_t<T,4>::vec_type v)
 	T t2 = OP::apply(v.z, v.w);
 	return OP::apply(t1, t2);
 }
-
-
 
 template <typename OP, typename T>
 inline __device__
@@ -87,102 +85,130 @@ __device__ void warp_reduce(volatile T *buffer, int tidx)
 	}
 }
 
+/**
+ * This code has been taken from https://moderngpu.github.io/scan.html,
+ * but I am not able to make it work
+ */
+__device__ int shfl_add(int x, int offset, int width = 32) {
+	int result = 0;
+#if __CUDA_ARCH__ >= 300
+	int mask = (32 - width)<< 8;
+	asm(
+			"{.reg .s32 r0;"
+			".reg .pred p;"
+			"shfl.up.b32 r0|p, %1, %2, %3;"
+			"@p add.s32 r0, r0, %4;"
+			"mov.s32 %0, r0; }"
+			: "=r"(result) : "r"(x), "r"(offset), "r"(mask), "r"(x));
+#endif
+	return result;
+}
+
+#define FULL_MASK 0xffffffff
 
 template <typename OP, typename T>
 __inline__ __device__
 T warp_reduce_shfl(T val)
 {
-  for (int offset = warpSize/2; offset > 0; offset /= 2)
-  {
-    val = OP::apply(val, __shfl_down(val, offset));
-  }
-  return val;
+
+#pragma unroll
+	for (int offset = warpSize/2; offset > 0; offset /= 2)
+	{
+		val = OP::apply(val, __shfl_down_sync(FULL_MASK, val, offset));
+	}
+
+//#pragma unroll
+//for (int offset = 1; offset < 32; offset*=2)
+//{
+//	val = shfl_add(val, offset);
+//}
+	return val;
 }
 
 template <typename OP, typename T>
 __inline__ __device__
 T block_reduce_sum(T val) {
 
-  static __shared__ T shared[32]; // Shared mem for 32 partial sums
-  int lane = threadIdx.x % warpSize;
-  int wid = threadIdx.x / warpSize;
+	static __shared__ T shared[32]; // Shared mem for 32 partial sums
+	int lane = threadIdx.x % warpSize;
+	int wid = threadIdx.x / warpSize;
 
-  val = warp_reduce_shfl<OP>(val);     // Each warp performs partial reduction
+	val = warp_reduce_shfl<OP>(val);     // Each warp performs partial reduction
 
-  if (lane==0) shared[wid]=val; // Write reduced value to shared memory
+	if (lane==0) shared[wid]=val; // Write reduced value to shared memory
 
-  __syncthreads();              // Wait for all partial reductions
+	__syncthreads();              // Wait for all partial reductions
 
-  //read from shared memory only if that warp existed
-  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0;
+	// read from shared memory only if that warp existed
+	val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0;
 
-  if (wid==0) val = warp_reduce_shfl<OP>(val); //Final reduce within first warp
+	if (wid==0) val = warp_reduce_shfl<OP>(val); //Final reduce within first warp
 
-  return val;
+	return val;
 }
 
 template<typename OP, unsigned int blockSize, typename T>
 __global__
 void device_reduce_kernel_1(const T *X, T* out, size_t const N)
 {
-    int idx = threadIdx.x + blockDim.x*blockIdx.x;
-    int tidx = threadIdx.x;
+	int idx = threadIdx.x + blockDim.x*blockIdx.x;
+	int tidx = threadIdx.x;
 
-    T sum = reduce_multiple_elements_4<OP>(X, N);
+	T sum = reduce_multiple_elements_4<OP>(X, N);
 
-    static __shared__ T shared_buffer[BLOCK_SIZE];
+	static __shared__ T shared_buffer[BLOCK_SIZE];
 
-    if (idx < N)
-    {
-    	shared_buffer[tidx] = sum;
-    }
-    else
-    {
-    	shared_buffer[tidx] = T(0);
-    }
-    __syncthreads();
+	if (idx < N)
+	{
+		shared_buffer[tidx] = sum;
+	}
+	else
+	{
+		shared_buffer[tidx] = T(0);
+	}
+	__syncthreads();
 
-    if (blockSize >= 1024){
-    	if (tidx < 512)
-    	{
-    		shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+512]);
-    	}
-    	__syncthreads();
-    }
+	if (blockSize >= 1024){
+		if (tidx < 512)
+		{
+			shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+512]);
+		}
+		__syncthreads();
+	}
 
-    if (blockSize >= 512){
-    	if (tidx < 256)
-    	{
-    		shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+256]);
-    	}
-    	__syncthreads();
-    }
+	if (blockSize >= 512){
+		if (tidx < 256)
+		{
+			shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+256]);
+		}
+		__syncthreads();
+	}
 
-    if (blockSize >= 256){
-    	if (tidx < 128)
-    	{
-    		shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+128]);
-    	}
-    	__syncthreads();
-    }
+	if (blockSize >= 256){
+		if (tidx < 128)
+		{
+			shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+128]);
+		}
+		__syncthreads();
+	}
 
-    if (blockSize >= 128){
-    	if (tidx < 64)
-    	{
-    		shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+64]);
-    	}
-    	__syncthreads();
-    }
+	if (blockSize >= 128){
+		if (tidx < 64)
+		{
+			shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+64]);
+		}
+		__syncthreads();
+	}
 
-    if (tidx < 32)
-    {
-    	warp_reduce<OP, blockSize>(shared_buffer, tidx);
-    }
+	if (tidx < 32)
+	{
+		warp_reduce<OP, blockSize>(shared_buffer, tidx);
+	}
 
-    if (threadIdx.x == 0)
-    {
-    	OP::apply_atomic(out, shared_buffer[0]);
-    }
+	if (threadIdx.x == 0)
+	{
+		OP::apply_atomic(out, shared_buffer[0]);
+	}
 }
 
 template <typename OP, typename T>
@@ -197,19 +223,20 @@ __global__ void device_reduce_kernel_2(const T *in, T* out, size_t N) {
 	{
 		OP::apply_atomic(out, sum);
 	}
-//	sum = warp_reduce_shfl<OP>(sum);
-//
-//	if ((threadIdx.x & (warpSize - 1)) == 0)
-//	{
-//		OP::apply_atomic(out, sum);
-//	}
+	// I tested with warp_reduce+atomic, but it was actually slower
+	//	sum = warp_reduce_shfl<OP>(sum);
+	//
+	//	if ((threadIdx.x & (warpSize - 1)) == 0)
+	//	{
+	//		OP::apply_atomic(out, sum);
+	//	}
 }
 
 template<typename OP, typename T>
 void reduce_kernel(const T * d_in, T * d_out, size_t N, ReductionMethod method)
 {
-	const int num_blocks = min(divUp(N, BLOCK_SIZE), size_t(BLOCK_SIZE));
-
+	const int num_blocks = min(divUp(N, BLOCK_SIZE), size_t(MAX_BLOCKS));
+//	const int num_blocks = divUp(N, BLOCK_SIZE);
 	switch(method)
 	{
 	case ReductionMethod::shared_mem_reduction:

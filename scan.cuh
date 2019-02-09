@@ -5,40 +5,48 @@ using flag_type = bool;
 
 // Sequential scan
 
-enum ScanKind{
+enum class ScanKind{
 	inclusive, exclusive
 };
 
-template<class OP, ScanKind Kind, class T>
-__device__ T scanWarp(volatile T *ptr, const unsigned int idx = threadIdx.x)
+enum class ScanMethod
 {
-	const unsigned int lane = idx&31; // index in the warp
+	brent_kung, kogge_stone
+};
+
+template<typename OP, ScanKind Kind, class T>
+__device__ T scan_warp_kogge_stone(volatile T *ptr, const unsigned int idx = threadIdx.x)
+{
+	// Kogge-stone warp scan
+	const unsigned int lane = idx & 31; // index in the warp ( idx & 0..011111 )
+
+	// Those operations are synchronised, so no need of any double buffering
 	if (lane >= 1) ptr[idx] = OP::apply(ptr[idx-1], ptr[idx]);
 	if (lane >= 2) ptr[idx] = OP::apply(ptr[idx-2], ptr[idx]);
 	if (lane >= 4) ptr[idx] = OP::apply(ptr[idx-4], ptr[idx]);
 	if (lane >= 8) ptr[idx] = OP::apply(ptr[idx-8], ptr[idx]);
 	if (lane >= 16) ptr[idx] = OP::apply(ptr[idx-16], ptr[idx]);
 
-	if (Kind == inclusive)
+	if (Kind == ScanKind::inclusive)
 		return ptr[idx];
 	else
-		return (lane>0 ? ptr[idx-1] : OP::identity());
+		return (lane>0 ? ptr[idx-1] : OP::identity(T()));
 
 }
 
-template<class OP, ScanKind Kind, class T>
-__device__ T scanBlock(volatile T *ptr, size_t const idx = threadIdx.x)
+template<typename OP, ScanKind Kind, class T>
+__device__ T scan_block_kogge_stone(volatile T *ptr, size_t const idx = threadIdx.x)
 {
 	const unsigned int lane = idx & 31;
 	const unsigned int warpid = idx >> 5;
 
-	T val = scanWarp<OP, Kind>(ptr, idx);
+	T val = scan_warp_kogge_stone<OP, Kind>(ptr, idx);
 	__syncthreads();
 
 	if (lane==31) ptr[warpid] = ptr[idx];
 	__syncthreads();
 
-	if (warpid==0) scanWarp<OP, Kind>(ptr, idx);
+	if (warpid==0) scan_warp_kogge_stone<OP, Kind>(ptr, idx);
 	__syncthreads();
 
 	if (warpid >0) val = OP::apply(ptr[warpid-1], val);
@@ -50,11 +58,42 @@ __device__ T scanBlock(volatile T *ptr, size_t const idx = threadIdx.x)
 	return val;
 
 }
-
-template<class OP, ScanKind Kind, class T>
-__global__ void scanModerngpuKernel1(T *ptr, T *block_results, size_t N)
+template<typename OP, ScanKind Kind, class T>
+__device__ T scan_block_brent_kung(volatile T *block_results, size_t const idx = threadIdx.x)
 {
-	extern __shared__ T buffer[];
+
+	// Upsweep
+	for (size_t stride = 1; stride < blockDim.x; stride *=2)
+	{
+		__syncthreads();
+		int index = (idx+1) * 2 * stride -1;
+		if (index < blockDim.x)
+		{
+			block_results[index] += block_results[index-stride];
+		}
+	}
+
+	// Downsweep
+	for (size_t stride = BLOCK_SIZE/4; stride > 0; stride /= 2)
+	{
+		__syncthreads();
+		int index = (idx+1) * 2 * stride -1;
+		if (index + stride  < BLOCK_SIZE)
+		{
+			block_results[index+stride] += block_results[index];
+		}
+	}
+	__syncthreads();
+
+	return block_results[idx];
+}
+
+template<typename OP, ScanKind Kind, class T>
+__global__ void scan_kernel_kogge_stone(T *ptr, T *block_results, size_t N)
+{
+	__shared__ T buffer[BLOCK_SIZE];
+
+	local_buffer[THREAD_GRANULARITY];
 
 	// Get the index of the array
 	size_t idx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -64,12 +103,16 @@ __global__ void scanModerngpuKernel1(T *ptr, T *block_results, size_t N)
 		buffer[threadIdx.x] = ptr[idx];
 	else
 		buffer[threadIdx.x] = 0;
+
+	for (int i = 0; i< THREAD_GRANULARITY; i++)
+		local_buffer[i] = ptr[THREAD_GRANULARITY * idx + i];
+
 	__syncthreads();
 
 	// Get the value in buffer
-	T val = scanBlock<OP, Kind>(buffer, threadIdx.x);
+	T val = scan_block_kogge_stone<OP, Kind>(buffer, threadIdx.x);
 
-	if (threadIdx.x == blockDim.x-1) {
+	if (block_results != nullptr && threadIdx.x == BLOCK_SIZE-1) {
 		block_results[blockIdx.x] = val;
 	}
 
@@ -78,142 +121,76 @@ __global__ void scanModerngpuKernel1(T *ptr, T *block_results, size_t N)
 	}
 }
 
-template<class OP, ScanKind Kind, class T>
-__global__ void scanModerngpuKernel2(T *block_results, size_t numBlocks)
+template <typename OP, ScanKind kind, typename T>
+__global__ void scan_block_brent_kung(T *ptr, T *intermediate_results, int N)
 {
-	extern __shared__ T buffer[];
-	size_t idx = threadIdx.x;
-	if (idx < numBlocks){
-		buffer[idx] = block_results[idx];
-		T val = scanBlock<OP, Kind>(buffer, idx);
-		block_results[idx] = val;
+	__shared__ T block_results[BLOCK_SIZE];
+	int idx = blockIdx.x*blockDim.x + threadIdx.x;
+
+	if (idx< N)
+	{
+		block_results[threadIdx.x] = ptr[idx];
+	}
+	else
+	{
+		block_results[threadIdx.x] = 0;
+	}
+
+	T val = scan_block_brent_kung<OP, kind>(block_results, threadIdx.x);
+
+	ptr[idx] = val;
+
+	if (intermediate_results != nullptr && threadIdx.x == BLOCK_SIZE -1)
+	{
+		intermediate_results[blockIdx.x] = block_results[threadIdx.x];
 	}
 }
 
-template<class OP, ScanKind Kind, class T>
-__global__ void scanModerngpuKernel3(T *ptr, T *block_results, size_t N)
+template <typename OP, typename T>
+__global__ void propagate(T *X, T* tmp, int N)
 {
-	size_t idx = threadIdx.x + blockIdx.x*blockDim.x;
-
-	if (idx < N && blockIdx.x > 0){
-		ptr[idx] = OP::apply(block_results[blockIdx.x -1], ptr[idx]);
+	int bidx = blockIdx.x;
+	int idx = threadIdx.x + bidx*BLOCK_SIZE;
+	if (idx < N && bidx > 0)
+	{
+		T acc = tmp[bidx-1];
+		X[idx] += acc;
 	}
-
 }
 
 template <typename OP, ScanKind kind, typename T>
-void parallelScanInPlace(gpuVector<T>& X)
+void scan_block(T * data, T * tmp_data, size_t N, size_t num_blocks, ScanMethod method)
 {
+	if (method == ScanMethod::brent_kung)
+	{
+		scan_block_brent_kung<Plus, kind><<<num_blocks, BLOCK_SIZE>>>(data, tmp_data, N);
+	}
+	else if (method == ScanMethod::kogge_stone)
+	{
+		scan_kernel_kogge_stone<Plus, kind><<<num_blocks, BLOCK_SIZE>>>(data, tmp_data, N);
+	}
+}
 
-	size_t const N = X.size();
-	size_t numBlocks = (N+BLOCK_SIZE-1)/BLOCK_SIZE;
+template <typename OP, ScanKind kind, typename T>
+void scan_in_place(gpuVector<T>& X, ScanMethod method = ScanMethod::brent_kung)
+{
+	int num_blocks = divUp(X.size(), BLOCK_SIZE);
 
-	gpuVector<T> blockResults(numBlocks);
-
-	// Step 1,2
-	scanModerngpuKernel1<OP, kind><<<numBlocks, BLOCK_SIZE, BLOCK_SIZE*sizeof(T)>>>(X.data(), blockResults.data(), N);
-
-	// Step 3
-	if (numBlocks > BLOCK_SIZE){
-		parallelScanInPlace<OP, kind>(blockResults);
-	} else {
-		scanModerngpuKernel2<OP, kind><<<1, BLOCK_SIZE, BLOCK_SIZE*sizeof(T)>>>(blockResults.data(), numBlocks);
+	if (num_blocks == 1){
+		scan_block<OP, kind>(X.data(), (T*)nullptr, X.size(), 1, method);
+		return;
 	}
 
-	// Step 4
-	scanModerngpuKernel3<OP, kind><<<numBlocks, BLOCK_SIZE, BLOCK_SIZE*sizeof(T)>>>(X.data(), blockResults.data(), N);
+	gpuVector<T> tmp(num_blocks);
+	scan_block<OP, kind>(X.data(), tmp.data(), X.size(), num_blocks, method);
+	scan_in_place<OP, kind, T>(tmp);
+	propagate<Plus, T><<<num_blocks, BLOCK_SIZE>>>(X.data(), tmp.data(), X.size());
 }
 
 template<typename OP, ScanKind kind, typename T>
-gpuVector<T> parallelScan(gpuVector<T> const& X)
+gpuVector<T> scan(gpuVector<T> const& X, ScanMethod method = ScanMethod::brent_kung)
 {
 	auto Y = gpuVector<T>(X);
-	parallelScanInPlace<OP, kind>(Y);
+	scan_in_place<OP, kind>(Y, method);
 	return Y;
-}
-
-template<class OP, ScanKind Kind, class T>
-__device__ T segscanWarp(volatile T *ptr, volatile flag_type *hd, const unsigned int idx = threadIdx.x)
-{
-	const unsigned int lane = idx & 31;
-
-	if (hd[idx]) hd[idx] = lane;
-
-	flag_type minindex = scanWarp<Max, inclusive>(hd);
-
-	if (idx >= minindex + 1) ptr[idx] = OP::apply(ptr[idx-1], ptr[idx]);
-	if (idx >= minindex + 2) ptr[idx] = OP::apply(ptr[idx-2], ptr[idx]);
-	if (idx >= minindex + 4) ptr[idx] = OP::apply(ptr[idx-4], ptr[idx]);
-	if (idx >= minindex + 8) ptr[idx] = OP::apply(ptr[idx-8], ptr[idx]);
-	if (idx >= minindex + 16) ptr[idx] = OP::apply(ptr[idx-16], ptr[idx]);
-
-	if (Kind == inclusive)
-		return ptr[idx];
-	else
-		return (lane > 0 && minindex != lane ? ptr[idx-1] : OP::identity());
-
-}
-
-// Segmented scan
-
-
-template<class OP, ScanKind Kind, class T>
-__device__ T segscanBlock(volatile T * ptr, volatile flag_type *hd, const unsigned int idx = threadIdx.x)
-{
-	unsigned int warpid = idx>>5;
-	unsigned int warp_first = warpid<<5;
-	unsigned int warp_last = warp_first + 31;
-
-	bool warp_is_open = (hd[warp_first] == 0);
-	__syncthreads();
-
-	T val = segscanWarp<OP, Kind>(ptr, hd, idx);
-
-	T warp_total = ptr[warp_last];
-
-	flag_type warp_flag = hd[warp_last]!=0 || !warp_is_open;
-	bool will_accumulate = warp_is_open && hd[idx] == 0;
-
-	__syncthreads();
-	if (idx == warp_last){
-		ptr[warpid] = warp_total;
-		hd[warpid] = warp_flag;
-
-	}
-
-	__syncthreads();
-
-	if (warpid == 0)
-		segscanWarp<OP, inclusive>(ptr, hd, idx);
-
-	__syncthreads();
-
-	if (warpid != 0 && will_accumulate)
-		val = OP::apply(ptr[warpid -1], val);
-
-	__syncthreads();
-
-	ptr[idx] = val;
-	__syncthreads();
-
-	return val;
-}
-
-template <typename T>
-__global__
-void segscanKernel(T * X, flag_type * partitions, size_t const N)
-{
-	extern __shared__ T buffer[];
-	extern __shared__ flag_type hd[];
-
-	size_t const idx = threadIdx.x + blockIdx.x * blockDim.x;
-
-	if (idx < N){
-		buffer[idx] = X[idx];
-		hd[idx] = partitions[idx];
-
-		segscanBlock(buffer, hd, idx);
-
-		X[idx] = buffer[idx];
-	}
 }
