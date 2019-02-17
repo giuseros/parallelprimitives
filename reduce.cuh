@@ -232,6 +232,68 @@ __global__ void device_reduce_kernel_2(const T *in, T* out, size_t N) {
 	//	}
 }
 
+template <typename OP, typename T>
+__global__ void device_reduce_kernel_3(const T *in, T* out, size_t N) {
+	//reduce multiple elements per thread
+
+	//reduce multiple elements per thread
+	int idx = threadIdx.x + blockDim.x*blockIdx.x;
+	int tidx = threadIdx.x;
+
+	static __shared__ T shared_buffer[BLOCK_SIZE];
+	if (idx < N)
+		{
+			shared_buffer[tidx] = in[idx];
+		}
+		else
+		{
+			shared_buffer[tidx] = T(0);
+		}
+		__syncthreads();
+
+		if (BLOCK_SIZE >= 1024){
+			if (tidx < 512)
+			{
+				shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+512]);
+			}
+			__syncthreads();
+		}
+
+		if (BLOCK_SIZE >= 512){
+			if (tidx < 256)
+			{
+				shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+256]);
+			}
+			__syncthreads();
+		}
+
+		if (BLOCK_SIZE >= 256){
+			if (tidx < 128)
+			{
+				shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+128]);
+			}
+			__syncthreads();
+		}
+
+		if (BLOCK_SIZE >= 128){
+			if (tidx < 64)
+			{
+				shared_buffer[tidx] = OP::apply(shared_buffer[tidx], shared_buffer[tidx+64]);
+			}
+			__syncthreads();
+		}
+
+		if (tidx < 32)
+		{
+			warp_reduce<OP, BLOCK_SIZE>(shared_buffer, tidx);
+		}
+
+		if (threadIdx.x == 0)
+		{
+			out[blockIdx.x] = shared_buffer[threadIdx.x];
+		}
+}
+
 template<typename OP, typename T>
 void reduce_kernel(const T * d_in, T * d_out, size_t N, ReductionMethod method)
 {

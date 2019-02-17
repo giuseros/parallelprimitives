@@ -4,7 +4,7 @@
 #include "gpuvector.cuh"
 #include <iostream>
 
-#define divUp(x,y) ((x+y-1)/y)
+#define divUp(x,y) ((x+y-1)/(y))
 
 
 template<typename T>
@@ -14,4 +14,4 @@ std::ostream& operator<<(std::ostream& out,  gpuVector<T> const& gpuVec)
 	for (auto e : hVec){ out<<e<<" ";}
 	return out;
 }
-#endif
+#endif // #define UTILS_CUH__

@@ -1,5 +1,9 @@
+#ifndef SCAN_CUH__
+#define SCAN_CUH__
+
 #include "config.cuh"
 #include "operators.cuh"
+#include "reduce.cuh"
 
 using flag_type = bool;
 
@@ -13,6 +17,61 @@ enum class ScanMethod
 {
 	brent_kung, kogge_stone
 };
+
+template<typename OP, ScanKind Kind, class T>
+__device__ T scan_block_brent_kung(volatile T *block_results, size_t const idx = threadIdx.x)
+{
+
+	// Upsweep
+	for (size_t stride = 1; stride < blockDim.x; stride *=2)
+	{
+		__syncthreads();
+		int index = (idx+1) * 2 * stride -1;
+		if (index < blockDim.x)
+		{
+			block_results[index] += block_results[index-stride];
+		}
+	}
+
+	// Downsweep
+	for (size_t stride = BLOCK_SIZE/4; stride > 0; stride /= 2)
+	{
+		__syncthreads();
+		int index = (idx+1) * 2 * stride -1;
+		if (index + stride  < BLOCK_SIZE)
+		{
+			block_results[index+stride] += block_results[index];
+		}
+	}
+	__syncthreads();
+
+	return block_results[idx];
+}
+
+template <typename OP, ScanKind kind, typename T>
+__global__ void scan_block_brent_kung(T *ptr, T *intermediate_results, int N)
+{
+	__shared__ T block_results[BLOCK_SIZE];
+	int idx = blockIdx.x*blockDim.x + threadIdx.x;
+
+	if (idx< N)
+	{
+		block_results[threadIdx.x] = ptr[idx];
+	}
+	else
+	{
+		block_results[threadIdx.x] = 0;
+	}
+
+	T val = scan_block_brent_kung<OP, kind>(block_results, threadIdx.x);
+
+	ptr[idx] = val;
+
+	if (intermediate_results != nullptr && threadIdx.x == BLOCK_SIZE -1)
+	{
+		intermediate_results[blockIdx.x] = block_results[threadIdx.x];
+	}
+}
 
 template<typename OP, ScanKind Kind, class T>
 __device__ T scan_warp_kogge_stone(volatile T *ptr, const unsigned int idx = threadIdx.x)
@@ -58,139 +117,102 @@ __device__ T scan_block_kogge_stone(volatile T *ptr, size_t const idx = threadId
 	return val;
 
 }
-template<typename OP, ScanKind Kind, class T>
-__device__ T scan_block_brent_kung(volatile T *block_results, size_t const idx = threadIdx.x)
-{
 
-	// Upsweep
-	for (size_t stride = 1; stride < blockDim.x; stride *=2)
-	{
-		__syncthreads();
-		int index = (idx+1) * 2 * stride -1;
-		if (index < blockDim.x)
-		{
-			block_results[index] += block_results[index-stride];
-		}
-	}
-
-	// Downsweep
-	for (size_t stride = BLOCK_SIZE/4; stride > 0; stride /= 2)
-	{
-		__syncthreads();
-		int index = (idx+1) * 2 * stride -1;
-		if (index + stride  < BLOCK_SIZE)
-		{
-			block_results[index+stride] += block_results[index];
-		}
-	}
-	__syncthreads();
-
-	return block_results[idx];
-}
-
-template<typename OP, ScanKind Kind, class T>
+template<typename OP, ScanKind Kind, int granularity, class T>
 __global__ void scan_kernel_kogge_stone(T *ptr, T *block_results, size_t N)
 {
-	__shared__ T buffer[BLOCK_SIZE];
+	extern __shared__ T buffer[];
 
-	local_buffer[THREAD_GRANULARITY];
+	T local_buffer[granularity];
 
 	// Get the index of the array
-	size_t idx = threadIdx.x + blockDim.x * blockIdx.x;
+	size_t idx = granularity*(threadIdx.x + blockDim.x * blockIdx.x);
+	T start = 0;
 
-	// Fill the buffer
-	if ( idx < N )
-		buffer[threadIdx.x] = ptr[idx];
-	else
-		buffer[threadIdx.x] = 0;
+	if (block_results != nullptr)
+	{
+		start = block_results[blockIdx.x];
+	}
+#pragma unroll
+	for (int i = 0; i< granularity && idx + i < N; i++)
+	{
+		local_buffer[i] = ptr[idx + i];
+	}
 
-	for (int i = 0; i< THREAD_GRANULARITY; i++)
-		local_buffer[i] = ptr[THREAD_GRANULARITY * idx + i];
+	T local_reduction = 0;
+
+#pragma unroll
+	for (int i = 0; i< granularity; i++)
+	{
+		local_reduction += local_buffer[i];
+	}
+
+	buffer[threadIdx.x] = local_reduction;
 
 	__syncthreads();
 
 	// Get the value in buffer
-	T val = scan_block_kogge_stone<OP, Kind>(buffer, threadIdx.x);
+	T val = scan_block_kogge_stone<OP, ScanKind::exclusive>(buffer, threadIdx.x);
 
-	if (block_results != nullptr && threadIdx.x == BLOCK_SIZE-1) {
-		block_results[blockIdx.x] = val;
+	int i_start = 0;
+
+	if (Kind == ScanKind::exclusive && idx < N){
+		ptr[idx] = (threadIdx.x  >=1 ? buffer[threadIdx.x -1] : 0);
+		i_start = 1;
 	}
 
-	if (idx < N){
-		ptr[idx] = val;
-	}
-}
-
-template <typename OP, ScanKind kind, typename T>
-__global__ void scan_block_brent_kung(T *ptr, T *intermediate_results, int N)
-{
-	__shared__ T block_results[BLOCK_SIZE];
-	int idx = blockIdx.x*blockDim.x + threadIdx.x;
-
-	if (idx< N)
+#pragma unroll
+	for (int i = 1; i < granularity; i++)
 	{
-		block_results[threadIdx.x] = ptr[idx];
+		local_buffer[i] += local_buffer[i-1];
+	}
+
+	if (granularity > 1)
+	{
+#pragma unroll
+		for (int i = i_start; i < granularity && idx + i < N; i++)
+		{
+			ptr[idx + i] = local_buffer[i - i_start] + val + start;
+		}
 	}
 	else
 	{
-		block_results[threadIdx.x] = 0;
-	}
-
-	T val = scan_block_brent_kung<OP, kind>(block_results, threadIdx.x);
-
-	ptr[idx] = val;
-
-	if (intermediate_results != nullptr && threadIdx.x == BLOCK_SIZE -1)
-	{
-		intermediate_results[blockIdx.x] = block_results[threadIdx.x];
-	}
-}
-
-template <typename OP, typename T>
-__global__ void propagate(T *X, T* tmp, int N)
-{
-	int bidx = blockIdx.x;
-	int idx = threadIdx.x + bidx*BLOCK_SIZE;
-	if (idx < N && bidx > 0)
-	{
-		T acc = tmp[bidx-1];
-		X[idx] += acc;
+		ptr[idx + i_start] = local_buffer[0] + val + start;
 	}
 }
 
 template <typename OP, ScanKind kind, typename T>
-void scan_block(T * data, T * tmp_data, size_t N, size_t num_blocks, ScanMethod method)
+void scan_in_place(gpuVector<T>& X)
 {
-	if (method == ScanMethod::brent_kung)
+	if (X.size() <= 256)
 	{
-		scan_block_brent_kung<Plus, kind><<<num_blocks, BLOCK_SIZE>>>(data, tmp_data, N);
+		scan_kernel_kogge_stone<OP, kind, 1><<<1, 256, 256*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
 	}
-	else if (method == ScanMethod::kogge_stone)
+	else if (X.size() <= 3*256)
 	{
-		scan_kernel_kogge_stone<Plus, kind><<<num_blocks, BLOCK_SIZE>>>(data, tmp_data, N);
+		scan_kernel_kogge_stone<OP, kind, 3><<<1, 256, 256*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
 	}
-}
-
-template <typename OP, ScanKind kind, typename T>
-void scan_in_place(gpuVector<T>& X, ScanMethod method = ScanMethod::brent_kung)
-{
-	int num_blocks = divUp(X.size(), BLOCK_SIZE);
-
-	if (num_blocks == 1){
-		scan_block<OP, kind>(X.data(), (T*)nullptr, X.size(), 1, method);
-		return;
+	else if(X.size() <= 5*512)
+	{
+		scan_kernel_kogge_stone<OP, kind, 5><<<1, 512, 512*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
 	}
+	else
+	{
+		int num_blocks = divUp(X.size(), 128);
+		gpuVector<T> tmp(num_blocks);
 
-	gpuVector<T> tmp(num_blocks);
-	scan_block<OP, kind>(X.data(), tmp.data(), X.size(), num_blocks, method);
-	scan_in_place<OP, kind, T>(tmp);
-	propagate<Plus, T><<<num_blocks, BLOCK_SIZE>>>(X.data(), tmp.data(), X.size());
+		device_reduce_kernel_3<OP><<<num_blocks, 8, 8*sizeof(T)>>>(X.data(), tmp.data(), X.size());
+		scan_in_place<OP, ScanKind::exclusive, T>(tmp);
+		scan_kernel_kogge_stone<OP, kind, 7><<<1, 128, 128*sizeof(T)>>>(X.data(), tmp.data(), X.size());
+	}
 }
 
 template<typename OP, ScanKind kind, typename T>
-gpuVector<T> scan(gpuVector<T> const& X, ScanMethod method = ScanMethod::brent_kung)
+gpuVector<T> scan(gpuVector<T> const& X)
 {
 	auto Y = gpuVector<T>(X);
-	scan_in_place<OP, kind>(Y, method);
+	scan_in_place<OP, kind>(Y);
 	return Y;
 }
+
+#endif // SCAN_CUH__
