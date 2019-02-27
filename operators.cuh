@@ -41,4 +41,21 @@ struct Max{
 
 };
 
+template<int K, typename T>
+struct Add{
+	inline static __host__ __device__
+	double apply(T a){
+		return a+T(K);
+	}
+};
+
+template <typename T>
+struct LT{
+	inline static __host__ __device__
+	bool compare(T a, T b)
+	{
+		return a < b;
+	}
+};
+
 #endif

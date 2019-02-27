@@ -21,37 +21,40 @@
  *
  */
 
-#ifndef __PERF__H__
-#define __PERF__H__
+#ifndef __UNARY__CUH__
+#define __UNARY__CUH__
 
-#include <cuda.h>
-#include <ctime>
+#include "utils.cuh"
+#include "config.cuh"
 
-template <typename F, typename... Args>
-float gputimeit(const F& func, Args&&... args)
+template <int granularity, typename OP, typename T>
+__global__ void unary_kernel(T * in, const int N)
 {
-	float time;
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
+	const int idx = threadIdx.x + (blockIdx.x/granularity) * blockDim.x*granularity;
 
-	cudaEventRecord(start);
-	func(args...);
-    cudaEventRecord(stop);
-
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&time, start, stop);
-    return time;
+#pragma unroll
+	for (int i= 0; i < granularity; i++)
+	{
+		const int k = idx + i*blockDim.x;
+		if (k < N)
+		{
+			in[k] = OP::apply(in[k]);
+		}
+	}
 }
 
-template <typename F, typename... Args>
-float cputimeit(const F& func, Args&&... args)
+
+template <typename OP, typename T>
+void unary_op(gpuVector<T>& v)
 {
-	std::clock_t    start;
-	start = std::clock();
-	func(args...);
-    auto t = (std::clock() - start) / (double)(CLOCKS_PER_SEC / 1000);
-	return double(t);
+	constexpr int block_size = 1024;
+	constexpr int granularity = 11;
+	const int num_blocks = divUp(v.size(), block_size*granularity);
+	unary_kernel<granularity, OP, T><<<num_blocks, block_size>>>(v.data(), v.size());
 }
 
-#endif // __PERF__H__
+#endif // __UNARY__CUH__
+
+
+
+

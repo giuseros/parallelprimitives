@@ -1,4 +1,4 @@
-NAME=test_scan
+NAME=test_sort
 
 all:
 	nvcc -O3 -std=c++11 -I. src/$(NAME).cu -gencode arch=compute_75,code=\"sm_75,compute_75\" -o  $(NAME)
