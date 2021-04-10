@@ -5,6 +5,8 @@
 #include <vector>
 #include <iostream>
 
+namespace pp{
+
 template <typename T>
 struct gpuVector
 {
@@ -18,7 +20,7 @@ public:
 
 	gpuVector(size_t size): fSize(size)
 	{
-		cudaMalloc(&fDevPtr, size * sizeof(T));
+		cudaMalloc(&fDevPtr, fSize * sizeof(T));
 	}
 
 	gpuVector(size_t size, T val) : fSize(size)
@@ -55,4 +57,16 @@ private:
 	size_t fSize;
 };
 
+template <typename T>
+std::ostream &operator<<(std::ostream &out, gpuVector<T> const &gpuVec)
+{
+	auto hVec = gpuVec.gather();
+	for (auto e : hVec)
+	{
+		out << e << " ";
+	}
+	return out;
+}
+
+}
 #endif

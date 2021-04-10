@@ -24,77 +24,17 @@
 #ifndef SCAN_CUH__
 #define SCAN_CUH__
 
-#include "config.cuh"
 #include "operators.cuh"
 #include "reduce.cuh"
 
-using flag_type = bool;
+#define SCAN_BLOCK_SIZE 256
 
-// Sequential scan
+using namespace pp;
 
 enum class ScanKind{
 	inclusive, exclusive
 };
 
-enum class ScanMethod
-{
-	brent_kung, kogge_stone
-};
-
-template<typename OP, ScanKind Kind, class T>
-__device__ T scan_block_brent_kung(volatile T *block_results, size_t const idx = threadIdx.x)
-{
-
-	// Upsweep
-	for (size_t stride = 1; stride < blockDim.x; stride *=2)
-	{
-		__syncthreads();
-		int index = (idx+1) * 2 * stride -1;
-		if (index < blockDim.x)
-		{
-			block_results[index] += block_results[index-stride];
-		}
-	}
-
-	// Downsweep
-	for (size_t stride = BLOCK_SIZE/4; stride > 0; stride /= 2)
-	{
-		__syncthreads();
-		int index = (idx+1) * 2 * stride -1;
-		if (index + stride  < BLOCK_SIZE)
-		{
-			block_results[index+stride] += block_results[index];
-		}
-	}
-	__syncthreads();
-
-	return block_results[idx];
-}
-
-template <typename OP, ScanKind kind, typename T>
-__global__ void scan_block_brent_kung(T *ptr, T *intermediate_results, int N)
-{
-	__shared__ T block_results[BLOCK_SIZE];
-	int idx = blockIdx.x*blockDim.x + threadIdx.x;
-
-	if (idx< N)
-	{
-		block_results[threadIdx.x] = ptr[idx];
-	}
-	else
-	{
-		block_results[threadIdx.x] = 0;
-	}
-
-	T val = scan_block_brent_kung<OP, kind>(block_results, threadIdx.x);
-
-	ptr[idx] = val;
-
-	if (intermediate_results != nullptr && threadIdx.x == BLOCK_SIZE -1)
-	{
-		intermediate_results[blockIdx.x] = block_results[threadIdx.x];
-	}
-}
 
 template<typename OP, ScanKind Kind, class T>
 __device__ T scan_warp_kogge_stone(volatile T *ptr, const unsigned int idx = threadIdx.x)
@@ -122,23 +62,27 @@ __device__ T scan_block_kogge_stone(volatile T *ptr, size_t const idx = threadId
 	const unsigned int lane = idx & 31;
 	const unsigned int warpid = idx >> 5;
 
+    // Scan each warp and save your local value
 	T val = scan_warp_kogge_stone<OP, Kind>(ptr, idx);
 	__syncthreads();
 
+    // Store the last lane of the warp in the first part of shared memory
 	if (lane==31) ptr[warpid] = ptr[idx];
 	__syncthreads();
 
+    // Scan the first warp
 	if (warpid==0) scan_warp_kogge_stone<OP, Kind>(ptr, idx);
 	__syncthreads();
 
+    // Distribute the scans
 	if (warpid >0) val = OP::apply(ptr[warpid-1], val);
 	__syncthreads();
 
+    // Store the correct value
 	ptr[idx] = val;
 	__syncthreads();
 
 	return val;
-
 }
 
 template<typename OP, ScanKind Kind, int granularity, class T>
@@ -146,6 +90,9 @@ __global__ void scan_kernel_kogge_stone(T *ptr, T *block_results, size_t N)
 {
 	extern __shared__ T buffer[];
 
+    /*
+     * Perform local reduction and store in buffer
+     */
 	T local_buffer[granularity];
 
 	// Get the index of the array
@@ -173,6 +120,8 @@ __global__ void scan_kernel_kogge_stone(T *ptr, T *block_results, size_t N)
 	buffer[threadIdx.x] = local_reduction;
 
 	__syncthreads();
+
+    // Start the block scan
 
 	// Get the value in buffer
 	T val = scan_block_kogge_stone<OP, ScanKind::exclusive>(buffer, threadIdx.x);
@@ -211,22 +160,25 @@ void scan_in_place(gpuVector<T>& X)
 	{
 		scan_kernel_kogge_stone<OP, kind, 1><<<1, 256, 256*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
 	}
-	else if (X.size() <= 3*256)
-	{
-		scan_kernel_kogge_stone<OP, kind, 3><<<1, 256, 256*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
-	}
-	else if(X.size() <= 5*512)
-	{
-		scan_kernel_kogge_stone<OP, kind, 5><<<1, 512, 512*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
-	}
+	// else if (X.size() <= 3*256)
+	// {
+	// 	scan_kernel_kogge_stone<OP, kind, 3><<<1, 256, 256*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
+	// }
+	// else if(X.size() <= 5*512)
+	// {
+	// 	scan_kernel_kogge_stone<OP, kind, 5><<<1, 512, 512*sizeof(T)>>>(X.data(), (T*)nullptr, X.size());
+	// }
 	else
 	{
-		int num_blocks = divUp(X.size(), 128);
-		gpuVector<T> tmp(num_blocks);
+        const int reduce_scan_block_size = 128;
+        const int num_blocks = min(divUp(X.size(), reduce_scan_block_size), size_t(REDUCE_MAX_BLOCKS));
+        const int granularity = 7;
+		const bool do_reduce_for_scan = true;
 
-		device_reduce_kernel_3<OP><<<num_blocks, 8, 8*sizeof(T)>>>(X.data(), tmp.data(), X.size());
-		scan_in_place<OP, ScanKind::exclusive, T>(tmp);
-		scan_kernel_kogge_stone<OP, kind, 7><<<1, 128, 128*sizeof(T)>>>(X.data(), tmp.data(), X.size());
+        gpuVector<T> tmp(num_blocks);
+		device_reduce_shared_mem<OP, reduce_scan_block_size, T, do_reduce_for_scan><<<num_blocks, reduce_scan_block_size>>>(X.data(), tmp.data(), X.size());
+        scan_in_place<OP, ScanKind::exclusive, T>(tmp);
+		scan_kernel_kogge_stone<OP, kind, granularity><<<1, reduce_scan_block_size, reduce_scan_block_size*sizeof(T)>>>(X.data(), tmp.data(), X.size());
 	}
 }
 
